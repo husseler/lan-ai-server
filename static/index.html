@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>LAN AI Chat</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 12px; background:#f7f7fb; }
+    #chat { max-width:800px; margin:20px auto; background:white; padding:12px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,0.06);}
+    .msg { padding:8px 10px; margin:6px 0; border-radius:6px; }
+    .user { background:#eaf2ff; text-align:right }
+    .bot { background:#f1f3f5; text-align:left }
+    #controls { display:flex; gap:8px; margin-top:8px; }
+    textarea { flex:1; min-height:60px; padding:8px; border-radius:6px; border:1px solid #ddd; }
+    button { padding:10px 14px; border-radius:6px; border:none; cursor:pointer; background:#1f6feb; color:white; }
+  </style>
+</head>
+<body>
+  <div id="chat">
+    <h3>LAN AI Chat</h3>
+    <div id="messages"></div>
+
+    <div id="controls">
+      <textarea id="prompt" placeholder="Ask something..."></textarea>
+      <button id="send">Send</button>
+    </div>
+  </div>
+
+  <script>
+    const sendBtn = document.getElementById('send');
+    const promptEl = document.getElementById('prompt');
+    const messages = document.getElementById('messages');
+
+    function append(text, cls='bot') {
+      const d = document.createElement('div');
+      d.className = 'msg ' + cls;
+      d.textContent = text;
+      messages.appendChild(d);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    sendBtn.onclick = async () => {
+      const prompt = promptEl.value.trim();
+      if (!prompt) return;
+      append(prompt, 'user');
+      promptEl.value = '';
+      append('…thinking…', 'bot');
+      const last = messages.lastChild;
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ prompt, max_tokens: 512, temperature: 0.2 })
+        });
+        messages.removeChild(last);
+        if (!res.ok) {
+          const t = await res.text();
+          append('Error: ' + t, 'bot');
+          return;
+        }
+        const j = await res.json();
+        append(j.answer || '(no answer)', 'bot');
+      } catch (e) {
+        messages.removeChild(last);
+        append('Network error: ' + e.message, 'bot');
+      }
+    };
+  </script>
+</body>
+</html>
