@@ -1,0 +1,336 @@
+# main.py
+import os
+import re
+import logging
+from typing import Optional, List, Tuple
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import httpx
+import uvicorn
+import json
+
+# ---------- Config ----------
+LOCAL_MODEL_API = os.environ.get("LOCAL_MODEL_API", "http://localhost:11434")
+OLLAMA_GENERATE_PATH = os.environ.get("OLLAMA_GENERATE_PATH", "/api/generate")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "tinyllama")
+DEFAULT_TIMEOUT = int(os.environ.get("MODEL_TIMEOUT_S", "180"))
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("lan-ai-server")
+
+# ---------- FastAPI app ----------
+app = FastAPI(title="LAN AI Server (async, formatted responses)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Request schema ----------
+class ChatRequest(BaseModel):
+    prompt: str
+    model: Optional[str] = DEFAULT_MODEL
+    temperature: Optional[float] = 0.2
+    max_tokens: Optional[int] = 256
+
+
+# ---------- Strong system prompt ----------
+SYSTEM_PROMPT = """
+You are a helpful AI assistant.
+
+Rules:
+- If the user provides code (```), then:
+  - Show code
+  - Explain line by line
+
+- If the user asks a normal question:
+  - Answer normally
+  - Do NOT force code explanation format
+
+- Always keep answers clear and well formatted.
+"""
+
+
+
+# ---------- Utilities ----------
+def extract_answer_from_model_json(j: dict) -> str:
+    """
+    Try a few common patterns returned by local model servers or LLM wrappers.
+    """
+    if not j:
+        return ""
+
+    if isinstance(j, str):
+        return j
+
+    # common direct fields
+    for key in ("response", "output", "result", "text"):
+        val = j.get(key) if isinstance(j, dict) else None
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # choices (openai-ish)
+    choices = j.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            if "text" in first and isinstance(first["text"], str):
+                return first["text"].strip()
+            if "message" in first and isinstance(first["message"], dict):
+                msg = first["message"]
+                if isinstance(msg.get("content"), str):
+                    return msg["content"].strip()
+                if isinstance(msg.get("content"), list):
+                    parts = []
+                    for item in msg["content"]:
+                        if isinstance(item, dict) and "text" in item:
+                            parts.append(item["text"])
+                    if parts:
+                        return "".join(parts).strip()
+
+    # outputs (ollama-ish)
+    outputs = j.get("outputs")
+    if isinstance(outputs, list) and outputs:
+        out0 = outputs[0]
+        if isinstance(out0, dict):
+            content = out0.get("content")
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                for piece in content:
+                    if isinstance(piece, dict) and piece.get("type") == "output_text" and isinstance(piece.get("text"), str):
+                        return piece.get("text").strip()
+            if "text" in out0 and isinstance(out0["text"], str):
+                return out0["text"].strip()
+
+    # fallback: try top-level concatenation of strings
+    try:
+        return json.dumps(j)[:20000]
+    except Exception:
+        return str(j)
+
+
+def find_code_blocks(text: str) -> List[Tuple[Optional[str], str]]:
+    """
+    Return list of (language, code) for each ```...``` block found.
+    language can be None if not specified.
+    """
+    code_blocks = []
+    # regex for ```lang\n...```
+    pattern = re.compile(r"```(?:\s*([\w+-]+))?\n(.*?)```", re.DOTALL)
+    for m in pattern.finditer(text):
+        lang = m.group(1)
+        code = m.group(2)
+        code_blocks.append((lang, code))
+    return code_blocks
+
+
+def explain_line_heuristic(line: str) -> str:
+    """Return a short explanation for a single code line using simple heuristics."""
+    s = line.strip()
+    # blank
+    if not s:
+        return "Blank or whitespace line."
+    # comments
+    if s.startswith("#"):
+        return "A comment describing the code or developer note."
+    # imports
+    if re.match(r"^\s*(from\s+[\w\.]+\s+import|import\s+[\w\.]+)", s):
+        return "Imports a module or symbol (makes functions/classes available)."
+    # function def
+    m = re.match(r"^\s*def\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*:", s)
+    if m:
+        name = m.group(1)
+        return f"Defines a function `{name}` with parameters ({m.group(2)})."
+    # class
+    m = re.match(r"^\s*class\s+([A-Za-z_]\w*)", s)
+    if m:
+        return f"Defines a class `{m.group(1)}`."
+    # for loop (common pattern)
+    m = re.match(r"^\s*for\s+(.+)\s+in\s+range\((.+)\)\s*:", s)
+    if m:
+        return f"Loops over the integers produced by `range({m.group(2)})`, assigning each to `{m.group(1).strip()}`."
+    m = re.match(r"^\s*for\s+(.+)\s+in\s+(.+)\s*:", s)
+    if m:
+        return f"Iterates: for {m.group(1).strip()} in {m.group(2).strip()}."
+    # while loop
+    if re.match(r"^\s*while\s+.*:", s):
+        return "A while loop that repeats while the condition is True."
+    # print
+    if re.search(r"\bprint\s*\(", s):
+        return "Calls `print()` to output the given value(s) to standard output."
+    # return
+    if re.match(r"^\s*return\b", s):
+        return "Returns a value from the current function."
+    # assignment
+    if re.match(r"^\s*[A-Za-z_]\w*\s*=", s):
+        m = re.match(r"^\s*([A-Za-z_]\w*)\s*=", s)
+        var = m.group(1) if m else None
+        return f"Assigns a value to the variable `{var}`." if var else "Assigns a value to a variable."
+    # context manager / with
+    if re.match(r"^\s*with\s+.*:", s):
+        return "Opens a context (e.g., file or resource) that will be automatically cleaned up."
+    # try/except
+    if re.match(r"^\s*try\s*:", s):
+        return "Begins a `try` block to catch exceptions."
+    if re.match(r"^\s*except\b", s):
+        return "Handles exceptions raised in the preceding `try` block."
+    # default
+    return "This line executes a statement or expression; its specific purpose isn't obvious from this single line."
+
+
+def auto_explain_code_block(code: str) -> str:
+    """
+    Produce a Markdown block with the original code and line-by-line explanations.
+    """
+    # Normalize line endings and split
+    lines = code.splitlines()
+    # Trim common leading indentation if present
+    # Determine minimum indent of non-blank lines
+    non_blank_indents = []
+    for ln in lines:
+        if ln.strip():
+            m = re.match(r"^(\s*)", ln)
+            non_blank_indents.append(len(m.group(1)) if m else 0)
+    if non_blank_indents:
+        min_indent = min(non_blank_indents)
+    else:
+        min_indent = 0
+    # Remove min_indent
+    normalized = [ln[min_indent:] if len(ln) >= min_indent else ln for ln in lines]
+
+    md_parts = []
+    md_parts.append("```python")
+    md_parts.extend(normalized)
+    md_parts.append("```")
+    md_parts.append("")  # blank line
+
+    line_no = 0
+    for ln in normalized:
+        if ln.strip() == "":
+            # Keep blank lines but skip numbering them
+            continue
+        line_no += 1
+        explanation = explain_line_heuristic(ln)
+        # Escape backticks in code text for safe inline display
+        code_text = ln.replace("`", "\\`")
+        md_parts.append(f"Line {line_no}: {code_text}")
+        md_parts.append(f"Explanation: {explanation}")
+        md_parts.append("")  # blank after each pair
+
+    if line_no == 0:
+        md_parts.append("> Could not find any non-empty lines in the code block.")
+
+    return "\n".join(md_parts)
+
+
+# ---------- Routes ----------
+@app.get("/", response_class=HTMLResponse)
+async def homepage():
+    """Serve a local static index.html if present (optional)."""
+    path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    if os.path.exists(path):
+        return FileResponse(path)
+    return HTMLResponse("<h1>LAN AI Server</h1><p>POST /chat with JSON {prompt, model, temperature, max_tokens}</p>")
+
+
+@app.post("/chat")
+async def chat_endpoint(req: Request):
+    """
+    Expects JSON body:
+    {
+      "prompt": "Explain this code ...",
+      "model": "tinyllama",
+      "temperature": 0.2,
+      "max_tokens": 256
+    }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    try:
+        payload_in = ChatRequest(**body)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid request schema: {e}")
+
+    user_prompt = payload_in.prompt.strip()
+    if not user_prompt:
+        raise HTTPException(status_code=400, detail="prompt required")
+
+    combined_prompt = SYSTEM_PROMPT + "\n\nUser:\n" + user_prompt + "\n\nAssistant:\n"
+
+    model_payload = {
+        "model": payload_in.model,
+        "prompt": combined_prompt,
+        "stream": False,
+        "options": {
+            "temperature": payload_in.temperature,
+            "num_predict": payload_in.max_tokens,
+        },
+    }
+
+    url = LOCAL_MODEL_API.rstrip("/") + OLLAMA_GENERATE_PATH
+    logger.info("Sending request to model: %s (model=%s)", url, payload_in.model)
+
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.post(url, json=model_payload)
+    except httpx.RequestError as exc:
+        logger.error("Model server not reachable: %s", exc)
+        return JSONResponse({"answer": "⚠ Model server not reachable"}, status_code=502)
+
+    if resp.status_code != 200:
+        logger.error("Model server returned status %s: %s", resp.status_code, resp.text)
+        return JSONResponse({"answer": "⚠ Model error", "status_code": resp.status_code, "detail": resp.text}, status_code=502)
+
+    try:
+        j = resp.json()
+    except Exception:
+        logger.exception("Invalid JSON from model")
+        return JSONResponse({"answer": "⚠ Invalid response from model"}, status_code=500)
+
+    model_answer = extract_answer_from_model_json(j).strip()
+
+    # If model already followed the required format, return as-is.
+    if re.search(r"Line\s+1\s*:", model_answer, re.IGNORECASE) and "Explanation:" in model_answer:
+        answer = model_answer
+    else:
+        # Model didn't follow the line-by-line format: attempt to auto-explain code block(s)
+        code_blocks = find_code_blocks(user_prompt)
+        if code_blocks:
+            # For now, explain only the first code block (common case). If you want multiple, iterate.
+            lang, code = code_blocks[0]
+            auto_md = auto_explain_code_block(code)
+            # If the model provided any useful extra text, append it below (but keep our structured explanation first)
+            extra = model_answer.strip()
+            if extra:
+                answer = auto_md + "\n\n---\n\n" + "Model output (fallback):\n\n" + extra
+            else:
+                answer = auto_md
+        else:
+            # No code block found — fallback to returning model answer (or a note if empty)
+            if model_answer:
+                answer = model_answer
+            else:
+                answer = "⚠ No response from model and no code block detected in the prompt."
+
+    return JSONResponse({"answer": answer})
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="info")
